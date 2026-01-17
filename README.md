@@ -62,6 +62,18 @@ echo 'export PATH="$PATH:/path/to/compact_repetition/target/release"' >> ~/.zshr
 source ~/.zshrc
 ```
 
+## Tips
+
+### Shell alias for clipboard compression
+
+Add to your `.zshrc` or `.bashrc`:
+
+```bash
+alias clog='pbpaste | comprende | pbcopy && echo "Compressed and copied"'
+```
+
+Then run `clog` after copying logs to compress them in your clipboard before pasting into an LLM.
+
 ## License
 
 MIT
