@@ -1,9 +1,74 @@
-use std::collections::HashMap;
+use lazy_static::lazy_static;
+use regex::Regex;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read};
+
+lazy_static! {
+    // Patterns for sub-token normalization
+    static ref HEX_PATTERN: Regex = Regex::new(r"^0x[a-fA-F0-9]+$").unwrap();
+    static ref BRACKETED_HEX: Regex = Regex::new(r"^\[0x[a-fA-F0-9]+\]$").unwrap();
+    static ref PURE_NUMBER: Regex = Regex::new(r"^\d+$").unwrap();
+    static ref TIMESTAMP_PATTERN: Regex = Regex::new(r"^\d{2}:\d{2}:\d{2}$").unwrap();
+}
+
+/// Represents a normalized token that may contain variable parts
+#[derive(Clone, Debug)]
+struct NormalizedToken {
+    /// The display form (original or with placeholders)
+    pattern: String,
+    /// Whether this token should be treated as inherently variable
+    is_variable: bool,
+}
+
+/// Normalize a single token, detecting patterns that indicate variability
+fn normalize_token(token: &str) -> NormalizedToken {
+    // Hex addresses like 0x104fc4000
+    if HEX_PATTERN.is_match(token) {
+        return NormalizedToken {
+            pattern: "<hex>".to_string(),
+            is_variable: true,
+        };
+    }
+
+    // Bracketed hex like [0x106111f74]
+    if BRACKETED_HEX.is_match(token) {
+        return NormalizedToken {
+            pattern: "[<hex>]".to_string(),
+            is_variable: true,
+        };
+    }
+
+    // Timestamps like 07:28:03
+    if TIMESTAMP_PATTERN.is_match(token) {
+        return NormalizedToken {
+            pattern: "<time>".to_string(),
+            is_variable: true,
+        };
+    }
+
+    // Pure numbers (5+ digits are likely variable identifiers)
+    if PURE_NUMBER.is_match(token) && token.len() >= 5 {
+        return NormalizedToken {
+            pattern: "<num>".to_string(),
+            is_variable: true,
+        };
+    }
+
+    // Default: keep as-is
+    NormalizedToken {
+        pattern: token.to_string(),
+        is_variable: false,
+    }
+}
 
 /// Tokenize a line by whitespace
 fn tokenize(line: &str) -> Vec<String> {
     line.split_whitespace().map(String::from).collect()
+}
+
+/// Tokenize and normalize a line
+fn tokenize_normalized(line: &str) -> Vec<NormalizedToken> {
+    line.split_whitespace().map(normalize_token).collect()
 }
 
 /// Compute Shannon entropy: H = -Σ p(x) log2 p(x)
@@ -30,97 +95,207 @@ struct PatternGroup {
     template: String,
     count: usize,
     samples: Vec<Vec<String>>, // samples[var_index] = vec of sample values
+    var_types: Vec<String>,    // type hint for each variable (e.g., "hex", "num", "")
+}
+
+/// A line with its normalized tokens and original tokens
+struct ParsedLine {
+    normalized: Vec<NormalizedToken>,
+    original: Vec<String>,
+}
+
+/// Calculate Jaccard similarity between two templates
+fn jaccard_similarity(t1: &[String], t2: &[String]) -> f64 {
+    let set1: HashSet<&String> = t1.iter().filter(|s| !s.starts_with('<')).collect();
+    let set2: HashSet<&String> = t2.iter().filter(|s| !s.starts_with('<')).collect();
+
+    if set1.is_empty() && set2.is_empty() {
+        return 1.0;
+    }
+
+    let intersection = set1.intersection(&set2).count();
+    let union = set1.union(&set2).count();
+
+    if union == 0 {
+        return 0.0;
+    }
+
+    intersection as f64 / union as f64
 }
 
 /// Process input and return compacted output
 fn process(input: &str) -> String {
-    let lines: Vec<Vec<String>> = input.lines().map(tokenize).collect();
+    // Parse all lines
+    let parsed_lines: Vec<ParsedLine> = input
+        .lines()
+        .map(|line| ParsedLine {
+            normalized: tokenize_normalized(line),
+            original: tokenize(line),
+        })
+        .collect();
 
-    if lines.is_empty() {
+    if parsed_lines.is_empty() {
         return String::new();
     }
 
-    let max_cols = lines.iter().map(|l| l.len()).max().unwrap_or(0);
-
-    let mut column_stats: Vec<HashMap<String, usize>> = vec![HashMap::new(); max_cols];
-    let mut column_counts: Vec<usize> = vec![0; max_cols];
-
-    for line in &lines {
-        for (col, token) in line.iter().enumerate() {
-            *column_stats[col].entry(token.clone()).or_insert(0) += 1;
-            column_counts[col] += 1;
-        }
+    // Step 1: Group lines by token count (length-based pre-grouping)
+    let mut length_groups: HashMap<usize, Vec<&ParsedLine>> = HashMap::new();
+    for line in &parsed_lines {
+        length_groups
+            .entry(line.original.len())
+            .or_default()
+            .push(line);
     }
 
-    let entropies: Vec<f64> = column_stats
-        .iter()
-        .zip(column_counts.iter())
-        .map(|(stats, count)| compute_entropy(stats, *count))
-        .collect();
+    // Step 2: Process each length group separately
+    let mut all_groups: Vec<PatternGroup> = Vec::new();
 
-    let threshold = determine_threshold(&column_stats, &column_counts, &entropies);
+    for (_len, lines) in length_groups {
+        if lines.is_empty() {
+            continue;
+        }
 
-    // Identify which columns are variable
-    let is_variable: Vec<bool> = (0..max_cols)
-        .map(|col| entropies.get(col).map(|e| *e > threshold).unwrap_or(false))
-        .collect();
+        let max_cols = lines.iter().map(|l| l.original.len()).max().unwrap_or(0);
 
-    // Group lines by their template pattern
-    let mut groups: HashMap<String, PatternGroup> = HashMap::new();
+        // Collect column statistics within this length group
+        let mut column_stats: Vec<HashMap<String, usize>> = vec![HashMap::new(); max_cols];
+        let mut column_counts: Vec<usize> = vec![0; max_cols];
+        let mut inherent_variable: Vec<bool> = vec![false; max_cols];
 
-    for line in &lines {
-        let mut template_parts = Vec::new();
-        let mut var_values: Vec<String> = Vec::new();
-        let mut var_idx = 0;
-
-        for (col, token) in line.iter().enumerate() {
-            if is_variable.get(col).copied().unwrap_or(false) {
-                template_parts.push(format!("<{}>", var_idx));
-                var_values.push(token.clone());
-                var_idx += 1;
-            } else {
-                template_parts.push(token.clone());
+        for line in &lines {
+            for (col, token) in line.normalized.iter().enumerate() {
+                // Track if any token in this column is inherently variable
+                if token.is_variable {
+                    inherent_variable[col] = true;
+                }
+                // Use the normalized pattern for statistics
+                *column_stats[col].entry(token.pattern.clone()).or_insert(0) += 1;
+                column_counts[col] += 1;
             }
         }
 
-        let template = template_parts.join(" ");
+        // Calculate per-column entropy within this group
+        let entropies: Vec<f64> = column_stats
+            .iter()
+            .zip(column_counts.iter())
+            .map(|(stats, count)| compute_entropy(stats, *count))
+            .collect();
 
-        groups
-            .entry(template.clone())
-            .and_modify(|g| {
-                g.count += 1;
-                // Add sample values (keep up to 3 unique per variable)
-                for (i, val) in var_values.iter().enumerate() {
-                    if g.samples.len() > i
-                        && g.samples[i].len() < 3
-                        && !g.samples[i].contains(val)
-                    {
-                        g.samples[i].push(val.clone());
+        let threshold = determine_threshold(&column_stats, &column_counts, &entropies);
+
+        // Identify which columns are variable (entropy-based OR inherently variable)
+        let is_variable: Vec<bool> = (0..max_cols)
+            .map(|col| {
+                inherent_variable.get(col).copied().unwrap_or(false)
+                    || entropies.get(col).map(|e| *e > threshold).unwrap_or(false)
+            })
+            .collect();
+
+        // Determine type hints for variable columns
+        let var_type_hints: Vec<String> = (0..max_cols)
+            .map(|col| {
+                if !is_variable.get(col).copied().unwrap_or(false) {
+                    return String::new();
+                }
+                // Check if all values in this column match a pattern
+                let stats = &column_stats[col];
+                if stats.len() == 1 {
+                    let key = stats.keys().next().unwrap();
+                    if key == "<hex>" {
+                        return "hex".to_string();
+                    }
+                    if key == "[<hex>]" {
+                        return "hex".to_string();
+                    }
+                    if key == "<num>" {
+                        return "num".to_string();
+                    }
+                    if key == "<time>" {
+                        return "time".to_string();
                     }
                 }
+                String::new()
             })
-            .or_insert_with(|| PatternGroup {
-                template,
-                count: 1,
-                samples: var_values.into_iter().map(|v| vec![v]).collect(),
-            });
+            .collect();
+
+        // Group lines by their template pattern
+        let mut groups: HashMap<String, PatternGroup> = HashMap::new();
+
+        for line in &lines {
+            let mut template_parts = Vec::new();
+            let mut var_values: Vec<String> = Vec::new();
+            let mut var_types: Vec<String> = Vec::new();
+            let mut var_idx = 0;
+
+            for (col, token) in line.original.iter().enumerate() {
+                if is_variable.get(col).copied().unwrap_or(false) {
+                    template_parts.push(format!("<{}>", var_idx));
+                    var_values.push(token.clone());
+                    var_types.push(var_type_hints.get(col).cloned().unwrap_or_default());
+                    var_idx += 1;
+                } else {
+                    template_parts.push(token.clone());
+                }
+            }
+
+            let template = template_parts.join(" ");
+
+            groups
+                .entry(template.clone())
+                .and_modify(|g| {
+                    g.count += 1;
+                    // Add sample values (keep up to 3 unique per variable)
+                    for (i, val) in var_values.iter().enumerate() {
+                        if g.samples.len() > i
+                            && g.samples[i].len() < 3
+                            && !g.samples[i].contains(val)
+                        {
+                            g.samples[i].push(val.clone());
+                        }
+                    }
+                })
+                .or_insert_with(|| PatternGroup {
+                    template,
+                    count: 1,
+                    samples: var_values.into_iter().map(|v| vec![v]).collect(),
+                    var_types,
+                });
+        }
+
+        all_groups.extend(groups.into_values());
     }
 
-    // Sort groups by count (descending)
-    let mut groups: Vec<_> = groups.into_values().collect();
-    groups.sort_by(|a, b| b.count.cmp(&a.count));
+    // Step 3: Merge similar templates (Jaccard similarity > 0.6)
+    all_groups = merge_similar_templates(all_groups, 0.6);
 
-    // Format output
+    // Sort groups by count (descending)
+    all_groups.sort_by(|a, b| b.count.cmp(&a.count));
+
+    // Format output with reduced verbosity
     let mut output = Vec::new();
-    for group in groups {
+    for group in all_groups {
         output.push(format!("[{}x] {}", group.count, group.template));
-        if !group.samples.is_empty() && group.samples.iter().any(|s| !s.is_empty()) {
+
+        // Reduce sample verbosity based on count
+        let max_samples = if group.count > 100 {
+            1
+        } else if group.count > 10 {
+            2
+        } else {
+            3
+        };
+
+        if !group.samples.is_empty() && group.samples.iter().any(|s| !s.is_empty())
+        {
             let samples_str: Vec<String> = group
                 .samples
                 .iter()
                 .enumerate()
                 .filter(|(_, s)| !s.is_empty())
-                .map(|(i, s)| format!("<{}>: {}", i, s.join(", ")))
+                .map(|(i, s)| {
+                    let limited: Vec<_> = s.iter().take(max_samples).cloned().collect();
+                    format!("<{}>: {}", i, limited.join(", "))
+                })
                 .collect();
             if !samples_str.is_empty() {
                 output.push(format!("     {}", samples_str.join(" | ")));
@@ -129,6 +304,147 @@ fn process(input: &str) -> String {
     }
 
     output.join("\n")
+}
+
+/// Merge templates with high Jaccard similarity
+fn merge_similar_templates(mut groups: Vec<PatternGroup>, threshold: f64) -> Vec<PatternGroup> {
+    if groups.len() < 2 {
+        return groups;
+    }
+
+    let mut merged = true;
+    while merged {
+        merged = false;
+
+        // Parse templates into token vectors for comparison
+        let templates: Vec<Vec<String>> = groups
+            .iter()
+            .map(|g| g.template.split_whitespace().map(String::from).collect())
+            .collect();
+
+        // Find pairs to merge
+        let mut merge_pair: Option<(usize, usize)> = None;
+
+        'outer: for i in 0..groups.len() {
+            for j in (i + 1)..groups.len() {
+                // Only merge templates with same token count
+                if templates[i].len() != templates[j].len() {
+                    continue;
+                }
+
+                let similarity = jaccard_similarity(&templates[i], &templates[j]);
+                if similarity >= threshold {
+                    merge_pair = Some((i, j));
+                    break 'outer;
+                }
+            }
+        }
+
+        if let Some((i, j)) = merge_pair {
+            // Merge group j into group i
+            let group_j = groups.remove(j);
+            let group_i = &mut groups[i];
+
+            // Create merged template: positions that differ become variables
+            let tokens_i: Vec<String> = group_i
+                .template
+                .split_whitespace()
+                .map(String::from)
+                .collect();
+            let tokens_j: Vec<String> = group_j
+                .template
+                .split_whitespace()
+                .map(String::from)
+                .collect();
+
+            let mut new_template_parts = Vec::new();
+            let mut new_samples: Vec<Vec<String>> = Vec::new();
+            let mut new_var_types: Vec<String> = Vec::new();
+
+            // Map old variable indices to their samples
+            let mut var_idx_i = 0;
+            let mut var_idx_j = 0;
+            let mut new_var_idx = 0;
+
+            for (ti, tj) in tokens_i.iter().zip(tokens_j.iter()) {
+                let is_var_i = ti.starts_with('<') && ti.ends_with('>');
+                let is_var_j = tj.starts_with('<') && tj.ends_with('>');
+
+                if ti == tj {
+                    // Same token (including matching placeholders)
+                    if is_var_i {
+                        new_template_parts.push(format!("<{}>", new_var_idx));
+
+                        // Merge samples from both groups
+                        let mut merged_samples: Vec<String> = Vec::new();
+                        if var_idx_i < group_i.samples.len() {
+                            merged_samples.extend(group_i.samples[var_idx_i].clone());
+                        }
+                        if var_idx_j < group_j.samples.len() {
+                            for s in &group_j.samples[var_idx_j] {
+                                if !merged_samples.contains(s) && merged_samples.len() < 3 {
+                                    merged_samples.push(s.clone());
+                                }
+                            }
+                        }
+                        new_samples.push(merged_samples);
+                        new_var_types.push(
+                            group_i
+                                .var_types
+                                .get(var_idx_i)
+                                .cloned()
+                                .unwrap_or_default(),
+                        );
+                        new_var_idx += 1;
+                        var_idx_i += 1;
+                        var_idx_j += 1;
+                    } else {
+                        new_template_parts.push(ti.clone());
+                    }
+                } else {
+                    // Different tokens - create a variable position
+                    new_template_parts.push(format!("<{}>", new_var_idx));
+
+                    let mut merged_samples: Vec<String> = Vec::new();
+
+                    if is_var_i {
+                        if var_idx_i < group_i.samples.len() {
+                            merged_samples.extend(group_i.samples[var_idx_i].clone());
+                        }
+                        var_idx_i += 1;
+                    } else {
+                        merged_samples.push(ti.clone());
+                    }
+
+                    if is_var_j {
+                        if var_idx_j < group_j.samples.len() {
+                            for s in &group_j.samples[var_idx_j] {
+                                if !merged_samples.contains(s) && merged_samples.len() < 3 {
+                                    merged_samples.push(s.clone());
+                                }
+                            }
+                        }
+                        var_idx_j += 1;
+                    } else if !merged_samples.contains(tj) && merged_samples.len() < 3 {
+                        merged_samples.push(tj.clone());
+                    }
+
+                    new_samples.push(merged_samples);
+                    new_var_types.push(String::new());
+                    new_var_idx += 1;
+                }
+            }
+
+            group_i.template = new_template_parts.join(" ");
+            group_i.count += group_j.count;
+            group_i.samples = new_samples;
+            group_i.var_types = new_var_types;
+
+            merged = true;
+        }
+    }
+
+    groups
 }
 
 fn main() -> io::Result<()> {
@@ -210,8 +526,8 @@ mod tests {
 +                                                     1744 ???  (in Live)  load address 0x104fc4000 + 0x123c3e8  [0x1062003e8]
 +                                                       1744 ???  (in Live)  load address 0x104fc4000 + 0x29975c  [0x10525d75c]"#;
 
-        let expected = r#"[9x] + 1744 ??? (in Live) load address 0x104fc4000 + <0> <1>
-     <0>: 0x114df74, 0x115c9c0, 0x1e99770 | <1>: [0x106111f74], [0x1061209c0], [0x106e5d770]"#;
+        let expected = r#"[9x] + 1744 ??? (in Live) load address <0> + <1> <2>
+     <0>: 0x104fc4000 | <1>: 0x114df74, 0x115c9c0, 0x1e99770 | <2>: [0x106111f74], [0x1061209c0], [0x106e5d770]"#;
 
         assert_eq!(process(input), expected);
     }
@@ -230,14 +546,19 @@ Dec 10 07:28:08 LabSZ sshd[24245]: Failed password for root from 112.95.230.3 po
 
     #[test]
     fn test_mixed_syslog() {
+        // With length-based grouping, different log types are processed separately
+        // The sshd lines (same token count) are grouped together
+        // The su lines (different token count) are in their own group
         let input = r#"Jun 15 02:04:59 combo sshd(pam_unix)[20892]: authentication failure; logname= uid=0 euid=0 tty=NODEVssh ruser= rhost=220-135-151-1.hinet-ip.hinet.net user=root
 Jun 15 02:04:59 combo sshd(pam_unix)[20892]: authentication failure; logname= uid=0 euid=0 tty=NODEVssh ruser= rhost=220-135-151-1.hinet-ip.hinet.net user=root
 Jun 15 02:04:59 combo sshd(pam_unix)[20892]: authentication failure; logname= uid=0 euid=0 tty=NODEVssh ruser= rhost=220-135-151-1.hinet-ip.hinet.net user=root
 Jun 15 04:06:18 combo su(pam_unix)[21416]: session opened for user cyrus
 Jun 15 04:06:19 combo su(pam_unix)[21416]: session closed for user cyrus"#;
 
-        let expected = r#"[3x] Jun 15 <0> combo sshd(pam_unix)[20892]: authentication <1> logname= uid=0 euid=0 tty=NODEVssh ruser= rhost=220-135-151-1.hinet-ip.hinet.net user=root
-     <0>: 02:04:59 | <1>: failure;
+        // The sshd lines are identical except timestamp is recognized as inherently variable
+        // The su lines have variable timestamps and opened/closed
+        let expected = r#"[3x] Jun 15 <0> combo sshd(pam_unix)[20892]: authentication failure; logname= uid=0 euid=0 tty=NODEVssh ruser= rhost=220-135-151-1.hinet-ip.hinet.net user=root
+     <0>: 02:04:59
 [2x] Jun 15 <0> combo su(pam_unix)[21416]: session <1> for user cyrus
      <0>: 04:06:18, 04:06:19 | <1>: opened, closed"#;
 
