@@ -210,63 +210,37 @@ mod tests {
 +                                                     1744 ???  (in Live)  load address 0x104fc4000 + 0x123c3e8  [0x1062003e8]
 +                                                       1744 ???  (in Live)  load address 0x104fc4000 + 0x29975c  [0x10525d75c]"#;
 
-        let output = process(input);
+        let expected = r#"[9x] + 1744 ??? (in Live) load address 0x104fc4000 + <0> <1>
+     <0>: 0x114df74, 0x115c9c0, 0x1e99770 | <1>: [0x106111f74], [0x1061209c0], [0x106e5d770]"#;
 
-        // 9 lines should compress to 2 lines (template + samples)
-        let lines: Vec<&str> = output.lines().collect();
-        assert_eq!(lines.len(), 2);
-        // Should show count
-        assert!(lines[0].starts_with("[9x]"));
-        // Should preserve structure
-        assert!(output.contains("1744"));
-        assert!(output.contains("Live"));
-        assert!(output.contains("load"));
-        assert!(output.contains("address"));
-        // Should show sample values
-        assert!(output.contains("0x114df74"));
+        assert_eq!(process(input), expected);
     }
 
     #[test]
     fn test_sshd_auth_logs() {
-        // Use same PID to ensure grouping works
         let input = r#"Dec 10 07:28:03 LabSZ sshd[24245]: Failed password for root from 112.95.230.3 port 54087 ssh2
 Dec 10 07:28:05 LabSZ sshd[24245]: Failed password for root from 112.95.230.3 port 55618 ssh2
 Dec 10 07:28:08 LabSZ sshd[24245]: Failed password for root from 112.95.230.3 port 57138 ssh2"#;
 
-        let output = process(input);
+        let expected = r#"[3x] Dec 10 <0> LabSZ sshd[24245]: Failed password for root from 112.95.230.3 port <1> ssh2
+     <0>: 07:28:03, 07:28:05, 07:28:08 | <1>: 54087, 55618, 57138"#;
 
-        // 3 identical lines -> 2 lines (template + samples)
-        let lines: Vec<&str> = output.lines().collect();
-        assert_eq!(lines.len(), 2);
-        // Should preserve structure keywords
-        assert!(output.contains("LabSZ"));
-        assert!(output.contains("Failed"));
-        assert!(output.contains("password"));
-        // Should show count
-        assert!(output.contains("[3x]"));
-        // Should show sample timestamps
-        assert!(output.contains("07:28:"));
+        assert_eq!(process(input), expected);
     }
 
     #[test]
     fn test_mixed_syslog() {
-        // Identical auth failure lines (same PID pattern)
         let input = r#"Jun 15 02:04:59 combo sshd(pam_unix)[20892]: authentication failure; logname= uid=0 euid=0 tty=NODEVssh ruser= rhost=220-135-151-1.hinet-ip.hinet.net user=root
 Jun 15 02:04:59 combo sshd(pam_unix)[20892]: authentication failure; logname= uid=0 euid=0 tty=NODEVssh ruser= rhost=220-135-151-1.hinet-ip.hinet.net user=root
 Jun 15 02:04:59 combo sshd(pam_unix)[20892]: authentication failure; logname= uid=0 euid=0 tty=NODEVssh ruser= rhost=220-135-151-1.hinet-ip.hinet.net user=root
 Jun 15 04:06:18 combo su(pam_unix)[21416]: session opened for user cyrus
 Jun 15 04:06:19 combo su(pam_unix)[21416]: session closed for user cyrus"#;
 
-        let output = process(input);
+        let expected = r#"[3x] Jun 15 <0> combo sshd(pam_unix)[20892]: authentication <1> logname= uid=0 euid=0 tty=NODEVssh ruser= rhost=220-135-151-1.hinet-ip.hinet.net user=root
+     <0>: 02:04:59 | <1>: failure;
+[2x] Jun 15 <0> combo su(pam_unix)[21416]: session <1> for user cyrus
+     <0>: 04:06:18, 04:06:19 | <1>: opened, closed"#;
 
-        // 5 lines -> 4 lines (3 auth=1 group + 2 session=2 groups, each with samples)
-        let lines: Vec<&str> = output.lines().collect();
-        assert!(lines.len() <= 6); // 3 groups * 2 lines each max
-        // Should preserve common structure
-        assert!(output.contains("combo"));
-        assert!(output.contains("authentication"));
-        assert!(output.contains("session"));
-        // Should have count for 3 repeated patterns
-        assert!(output.contains("[3x]"));
+        assert_eq!(process(input), expected);
     }
 }
