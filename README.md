@@ -37,10 +37,29 @@ cat logs.txt | comprende
 4. **Group lines** by template pattern
 5. **Output** each pattern once with count and sample values
 
-## Building
+## Installation
+
+### Prerequisites
+
+Install Rust using the instructions at [rustup.rs](https://rustup.rs/), then restart your terminal or run `source "$HOME/.cargo/env"`.
+
+### Building
 
 ```bash
 cargo build --release
+```
+
+### Adding to PATH
+
+```bash
+cp target/release/comprende ~/.cargo/bin/
+```
+
+Or add the build directory to your PATH:
+
+```bash
+echo 'export PATH="$PATH:/path/to/compact_repetition/target/release"' >> ~/.zshrc
+source ~/.zshrc
 ```
 
 ## License
