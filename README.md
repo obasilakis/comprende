@@ -1,6 +1,6 @@
 # comprende
 
-Compresses repetitive logs for LLM consumption. A simplified [Drain](https://jiemingzhu.github.io/pub/pjhe_icws2017.pdf) algorithm that identifies patterns, deduplicates them, and shows sample values.
+Compresses repetitive logs for LLM consumption. Feed it a 350KB stack trace, get back 50KB of clean, deduplicated output that any LLM can parse. No more "context window exceeded" errors when debugging production issues.
 
 ## Usage
 
@@ -23,19 +23,31 @@ cat logs.txt | comprende
 + 1744 ???  (in Live)  load address 0x104fc4000 + 0x29975c  [0x10525d75c]
 ```
 
-**Output (2 lines):**
+**Output (1 line):**
 ```
-[9x] + 1744 ??? (in Live) load address 0x104fc4000 + <0> <1>
-     <0>: 0x114df74, 0x115c9c0, 0x1e99770 | <1>: [0x106111f74], [0x1061209c0], [0x106e5d770]
+[9x] 1744 ???  (in Live)  load address <hex> + <hex>  <addr>
 ```
 
-## How It Works
+## What Gets Normalized
 
-1. **Tokenize** each line by whitespace
-2. **Compute entropy** per column: `H = -Σ p(x) log₂ p(x)`
-3. **Identify noise** - high entropy columns (addresses, timestamps, counters)
-4. **Group lines** by template pattern
-5. **Output** each pattern once with count and sample values
+- **Hex addresses**: `0x104fc4000` → `<hex>`
+- **Bracketed addresses**: `[0x106111f74]` → `<addr>`
+- **UUIDs**: `<4B0BCBB4-2271-376E-B5C3-CC18D418FC11>` → `<uuid>`
+- **Thread IDs**: `Thread_4243153` → `Thread_<id>`
+- **Timestamps**: `07:28:03` → `<time>`
+- **Large numbers** (5+ digits): `54087` → `<num>`
+- **Indentation/tree markers**: stripped for better grouping
+
+## Binary Images (macOS crash/sample reports)
+
+For macOS stack traces, comprende keeps app/plugin images but summarizes system libraries:
+
+```
+=== Binary Images ===
+<hex> - <hex> com.xfer.serum2.VST3 (2.0.22) <uuid> /Library/Audio/Plug-Ins/VST3/Serum2.vst3/...
+<hex> - <hex> com.xlnaudio.xo (1.7.5) <uuid> /Library/Audio/Plug-Ins/VST3/XO.vst3/...
+[1076 system libraries omitted]
+```
 
 ## Installation
 
